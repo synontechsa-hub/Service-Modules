@@ -1,61 +1,62 @@
-# auth
+# Auth Service Module
 
-Copy-in authentication and user management module. Provides full registration, login, JWT issuance, and refresh token rotation.
+Drop-in authentication package for FastAPI applications using SQLAlchemy async sessions.
 
-**Convention:** importable Python package, not a standalone service.
-Copy the `auth/` folder into your project and wire it into your FastAPI app.
+## Scope
+Provides local username/email registration, Argon2id password hashing, RS256 access tokens, opaque refresh-token rotation, replay detection by token family, brute-force lockout, logout/revocation, and a FastAPI current-user dependency.
 
-## What it does
+`OAuthAccount` is only the persistence primitive for linking external identities. Provider redirect/callback flows are intentionally host-owned and are not implemented by this module.
 
-- **User registration and login** (Argon2id hashing)
-- **JWT access tokens** (RS256 asymmetric signing)
-- **Refresh token rotation** (opaque tokens, hashed in DB, single-use with replay detection)
-- **Account lockout** (brute-force protection)
-- **OAuth support** (Google, Facebook, Discord, Apple) — via `OAuthAccount` links
-- **Modular configuration** (Pydantic-settings with `AUTH_` prefix)
+## Architecture contract
+- Copy-in package: no `main.py`, database engine, Docker runtime, or `.env` loader.
+- The host creates one `AsyncSession` per request/task and injects it into `AuthService`.
+- The host supplies `AuthConfig` directly. The module never reads environment variables or secret files.
+- The host owns migrations. `schema.sql` documents the required PostgreSQL/Supabase schema.
+- The optional audit hook is fail-open: audit outages are logged and do not turn a completed auth action into an API failure.
 
-## Setup
-
-1. Copy the `auth/` folder into your project.
-2. Define your SQLAlchemy models by inheriting from `AuthBase` or mapping the provided models.
-3. Configure your RSA keys (private and public) for JWT signing.
-4. Copy `.env.example` values into your `.env` (prefixed with `AUTH_`).
-5. `pip install -r requirements.txt`.
-
-## Wiring it in
+## Configuration
+Generate an RSA key pair of at least 2048 bits outside the repository. Load the PEM strings through the host's secret/config system:
 
 ```python
-from fastapi import FastAPI, Depends
+from auth import AuthConfig
+
+auth_config = AuthConfig(
+    jwt_private_key=settings.AUTH_JWT_PRIVATE_KEY,
+    jwt_public_key=settings.AUTH_JWT_PUBLIC_KEY,
+    secret_key=settings.AUTH_SECRET_KEY,
+    jwt_issuer="my-product",
+    jwt_audience="my-product-api",
+)
+```
+
+`secret_key` must be at least 32 bytes. Never commit private keys or production secrets.
+
+## Wiring
+```python
+from fastapi import Depends, FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession
-from auth import AuthConfig, AuthService, get_auth_router
+from auth import AuthService, get_auth_router, get_current_user_dependency
 
 app = FastAPI()
 
-# 1. Config
-auth_config = AuthConfig(secret_key="your-secret-key")
+async def get_auth_service(db: AsyncSession = Depends(get_db)) -> AuthService:
+    return AuthService(config=auth_config, db=db, audit_service=audit_service)
 
-# 2. Service Dependency
-async def get_auth_service(db: AsyncSession = Depends(get_db)):
-    return AuthService(config=auth_config, db=db)
-
-# 3. Router
-auth_router = get_auth_router(auth_service_dep=get_auth_service)
-app.include_router(auth_router)
+app.include_router(get_auth_router(get_auth_service))
+get_current_user = get_current_user_dependency(get_auth_service)
 ```
 
-## Security recommendations
+## Refresh-token security
+Refresh tokens are stored only as SHA-256 hashes. Each login starts a new token family. A normal refresh revokes the used token and issues its replacement in the same family. Reuse of a revoked token is treated as replay and revokes the remaining live tokens in that family.
 
-- **RS256 keys**: Use a minimum of 2048-bit RSA keys.
-- **Secret Key**: Use a strong, random string for `AUTH_SECRET_KEY` (used for symmetric encryption of sensitive data like OAuth states).
-- **Production**: Always run behind HTTPS. The module itself is protocol-agnostic but expects to be served securely.
+## Security behavior
+- Passwords: Argon2id via `argon2-cffi`.
+- JWTs: RS256 only; issuer, audience, expiry, issued-at, subject, JWT ID, and token type are required on decode.
+- Reserved JWT claims cannot be overridden through `extra_claims`.
+- RSA keys are validated for type, minimum size, and pairing.
+- Unknown-user login performs a dummy Argon2 verification to reduce account-enumeration timing differences.
+- Login counters and refresh rotation use database row locks on PostgreSQL to avoid concurrent lost updates/double rotation.
+- Revoked refresh records are retained beyond expiry for the configured replay-detection retention window.
 
-## Files
-
-| File | Purpose |
-|---|---|
-| `config.py` | Env-driven settings (`AUTH_` prefix) |
-| `models.py` | SQLAlchemy models (`User`, `RefreshToken`, `OAuthAccount`) |
-| `schemas.py` | Pydantic request/response models |
-| `security.py` | Cryptographic primitives (JWT, hashing, encryption) |
-| `service.py` | `AuthService` — the core business logic |
-| `router.py` | FastAPI router factory |
+## Integration note
+`AsyncSession` is stateful and must not be shared across concurrent asyncio tasks. Use one session per request/task.
