@@ -11,6 +11,18 @@ __pycache__/
 .nox/
 .hypothesis/
 
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+*.pem
+*.key
+*.p8
+**/keys/
+
 # Test and local temp output
 .tmp/
 tmp/
